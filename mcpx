@@ -1,0 +1,716 @@
+#!/usr/bin/env -S uv run --script
+# /// script
+# requires-python = ">=3.11"
+# dependencies = [
+#     "fastmcp>=2.10",
+#     "click>=8.1",
+#     "py-key-value-aio[filetree]>=0.4",
+# ]
+# ///
+"""mcpx -- a sweet little CLI for talking to MCP servers.
+
+Workflow:
+    echo '{"mcpServers": {"atlassian": {"type": "http", "url": "https://mcp.atlassian.com/v1/mcp"}}}' > .mcp.json
+    mcpx server atlassian         # log in (interactive OAuth if the server needs it)
+    mcpx server atlassian --refresh  # re-fetch the catalog without re-auth
+    mcpx tool --help              # lists servers and their tool names
+    mcpx tool atlassian --help    # lists atlassian tools with descriptions
+    mcpx tool atlassian jira_issue_details --query "DSMLE1-5823"
+
+Shell completion (server, tool, prompt, and resource names complete from the
+cached catalog, courtesy of click):
+    eval "$(_MCPX_COMPLETE=zsh_source mcpx)"    # zsh
+    eval "$(_MCPX_COMPLETE=bash_source mcpx)"   # bash
+    _MCPX_COMPLETE=fish_source mcpx | source    # fish
+"""
+
+from __future__ import annotations
+
+import asyncio
+import base64
+import hashlib
+import json
+import os
+import re
+import sys
+from datetime import datetime, timezone
+from pathlib import Path
+from urllib.parse import quote
+
+import click
+from fastmcp import Client
+from fastmcp.client.auth import OAuth
+from key_value.aio.stores.filetree import (
+    FileTreeStore,
+    FileTreeV1CollectionSanitizationStrategy,
+    FileTreeV1KeySanitizationStrategy,
+)
+
+CACHE_DIR = Path.home() / ".cache" / "mcpx"
+GLOBAL_CONFIG = Path.home() / ".config" / "mcpx" / "mcp.json"
+HTTP_TYPES = {"http", "sse", "streamable-http", "streamable_http"}
+
+
+# --------------------------------------------------------------------------- #
+# config / cache plumbing
+# --------------------------------------------------------------------------- #
+
+def config_path_from_ctx(ctx: click.Context) -> Path:
+    root = ctx.find_root()
+    raw = root.params.get("config") or ".mcp.json"
+    path = Path(raw).expanduser()
+    if not path.is_absolute() and not path.exists():
+        # git-style: walk up from cwd looking for the config file, so running
+        # from a subdirectory of a project finds the project's .mcp.json.
+        for parent in Path.cwd().resolve().parents:
+            candidate = parent / raw
+            if candidate.exists():
+                return candidate
+    return path.resolve()
+
+
+def cache_path_for(config_path: Path) -> Path:
+    digest = hashlib.sha1(str(config_path).encode()).hexdigest()[:16]
+    return CACHE_DIR / f"{digest}.json"
+
+
+def load_cache(ctx: click.Context) -> dict:
+    """Load (and memoize per invocation) the catalog cache for this config."""
+    root = ctx.find_root()
+    if "cache" not in root.meta:
+        path = cache_path_for(config_path_from_ctx(ctx))
+        root.meta["cache"] = (
+            json.loads(path.read_text()) if path.exists() else {"servers": {}}
+        )
+    return root.meta["cache"]
+
+
+def apply_ca_bundle(bundle: str, *, override: bool = True) -> None:
+    """Point httpx (and anything else that trusts the env) at a CA bundle.
+
+    httpx honors SSL_CERT_FILE whenever trust_env is on, which covers the MCP
+    transport, FastMCP's OAuth discovery/token requests, and stdio subprocesses.
+    """
+    bundle = str(Path(bundle).expanduser().resolve())
+    for var in ("SSL_CERT_FILE", "REQUESTS_CA_BUNDLE", "CURL_CA_BUNDLE"):
+        if override or not os.environ.get(var):
+            os.environ[var] = bundle
+
+
+def save_cache(config_path: Path, cache: dict) -> None:
+    path = cache_path_for(config_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    path.parent.chmod(0o700)
+    path.write_text(json.dumps(cache, indent=2))
+    # The cached config may contain secrets (auth headers, env vars).
+    path.chmod(0o600)
+
+
+def read_servers(path: Path) -> dict:
+    data = json.loads(path.read_text())
+    return data.get("mcpServers") or data.get("servers") or {}
+
+
+def load_config(config_path: Path) -> dict:
+    """Merge the global config (~/.config/mcpx/mcp.json) with the local one.
+
+    Local entries win on name collisions.
+    """
+    servers: dict = {}
+    if GLOBAL_CONFIG.exists():
+        servers.update(read_servers(GLOBAL_CONFIG))
+    if config_path.exists():
+        servers.update(read_servers(config_path))
+    elif not servers:
+        raise click.ClickException(
+            f"config file not found: {config_path} (and no {GLOBAL_CONFIG})"
+        )
+    if not servers:
+        raise click.ClickException(
+            f"no 'mcpServers' found in {config_path} or {GLOBAL_CONFIG}"
+        )
+    return servers
+
+
+def server_is_http(cfg: dict) -> bool:
+    t = cfg.get("type") or ("http" if "url" in cfg else "stdio")
+    return t in HTTP_TYPES
+
+
+def make_oauth(url: str) -> OAuth:
+    """OAuth with persistent token storage so login survives across runs."""
+    token_dir = CACHE_DIR / "oauth"
+    token_dir.mkdir(parents=True, exist_ok=True)
+    token_dir.chmod(0o700)
+    storage = FileTreeStore(
+        data_directory=token_dir,
+        key_sanitization_strategy=FileTreeV1KeySanitizationStrategy(directory=token_dir),
+        collection_sanitization_strategy=FileTreeV1CollectionSanitizationStrategy(
+            directory=token_dir
+        ),
+    )
+    return OAuth(url, token_storage=storage, client_name="mcpx")
+
+
+def dest_name(name: str) -> str:
+    """Mangle an MCP parameter name into a click-safe callback kwarg."""
+    return re.sub(r"\W", "_", name)
+
+
+def run_on_server(server: str, entry: dict, action):
+    """Open a client to a cached server and run an async action on it."""
+    async def go():
+        async with build_client(server, entry["config"], entry.get("auth")) as client:
+            return await action(client)
+
+    try:
+        return asyncio.run(go())
+    except click.ClickException:
+        raise
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(
+            f"request to '{server}' failed: {exc} "
+            f"(the catalog is cached at login time; "
+            f"try `mcpx server {server} --refresh`)"
+        )
+
+
+def build_client(name: str, cfg: dict, auth: str | None) -> Client:
+    # "description" is an mcpx extension for `mcpx server --list`; strip it
+    # before handing the config to fastmcp.
+    cfg = {k: v for k, v in cfg.items() if k != "description"}
+    if server_is_http(cfg):
+        kwargs = {}
+        if cfg.get("headers"):
+            kwargs["headers"] = cfg["headers"]
+        if auth == "oauth":
+            kwargs["auth"] = make_oauth(cfg["url"])
+        return Client(cfg["url"], **kwargs)
+    # stdio & friends: hand the single-server config to fastmcp (no prefixing
+    # happens for a single server)
+    return Client({"mcpServers": {name: cfg}})
+
+
+# --------------------------------------------------------------------------- #
+# result rendering
+# --------------------------------------------------------------------------- #
+
+def print_tool_result(result) -> None:
+    structured = getattr(result, "structured_content", None)
+    if structured:
+        # fastmcp wraps scalar-returning tools in {"result": ...}; unwrap it.
+        if isinstance(structured, dict) and set(structured) == {"result"}:
+            structured = structured["result"]
+        if isinstance(structured, str):
+            click.echo(structured)
+        else:
+            click.echo(json.dumps(structured, indent=2))
+        return
+    for block in result.content or []:
+        if getattr(block, "text", None) is not None:
+            click.echo(block.text)
+        else:
+            click.echo(json.dumps(block.model_dump(mode="json"), indent=2))
+
+
+def print_prompt_result(result) -> None:
+    for msg in result.messages:
+        content = msg.content
+        text = getattr(content, "text", None)
+        if text is None:
+            text = json.dumps(content.model_dump(mode="json"), indent=2)
+        click.echo(f"[{msg.role}] {text}")
+
+
+def print_resource_result(contents) -> None:
+    for item in contents:
+        if getattr(item, "text", None) is not None:
+            click.echo(item.text)
+        elif getattr(item, "blob", None) is not None:
+            # Per the MCP spec, blob contents are base64-encoded strings.
+            blob = item.blob
+            sys.stdout.buffer.write(
+                base64.b64decode(blob) if isinstance(blob, str) else blob
+            )
+        else:
+            click.echo(json.dumps(item.model_dump(mode="json"), indent=2))
+
+
+# --------------------------------------------------------------------------- #
+# click parameter generation from JSON schema
+# --------------------------------------------------------------------------- #
+
+class JsonParamType(click.ParamType):
+    name = "json"
+
+    def __init__(self, strict: bool = False):
+        self.strict = strict
+
+    def convert(self, value, param, ctx):
+        if not isinstance(value, str):
+            return value
+        try:
+            return json.loads(value)
+        except json.JSONDecodeError as exc:
+            if self.strict:  # array/object params must be valid JSON
+                self.fail(f"invalid JSON ({exc})", param, ctx)
+            return value  # untyped params: let plain strings pass through
+
+
+JSON_TYPE = JsonParamType()
+STRICT_JSON = JsonParamType(strict=True)
+
+SCHEMA_TYPES = {
+    "string": click.STRING,
+    "integer": click.INT,
+    "number": click.FLOAT,
+    "array": STRICT_JSON,
+    "object": STRICT_JSON,
+}
+
+
+def options_from_schema(schema: dict) -> tuple[list[click.Option], dict[str, str]]:
+    """Build click options from a JSON schema. Returns (options, dest->name map)."""
+    options: list[click.Option] = []
+    dest_map: dict[str, str] = {}
+    props = (schema or {}).get("properties") or {}
+    required = set((schema or {}).get("required") or [])
+    for pname, pschema in props.items():
+        pschema = pschema if isinstance(pschema, dict) else {}
+        stype = pschema.get("type")
+        ptype = SCHEMA_TYPES.get(stype, JSON_TYPE)
+        dest = dest_name(pname)
+        dest_map[dest] = pname
+        is_required = pname in required
+        help_text = (pschema.get("description") or "").strip() or None
+        if stype == "boolean":
+            flag = pname.replace("_", "-")
+            options.append(
+                click.Option(
+                    [f"--{flag}/--no-{flag}", dest],
+                    required=is_required,
+                    default=None,
+                    help=help_text,
+                    show_default=False,
+                )
+            )
+            continue
+        if ptype is JSON_TYPE:  # untyped / anyOf: coercion is best-effort
+            note = "[json: parsed as JSON if valid, else sent as a string]"
+            help_text = f"{help_text or ''}  {note}".strip()
+        if not is_required and "default" in pschema:
+            default_str = json.dumps(pschema["default"])
+            help_text = f"{help_text or ''}  [default: {default_str}]".strip()
+        options.append(
+            click.Option(
+                [f"--{pname.replace('_', '-')}", dest],
+                type=ptype,
+                required=is_required,
+                default=None,
+                help=help_text,
+                show_default=False,
+            )
+        )
+    return options, dest_map
+
+
+# --------------------------------------------------------------------------- #
+# dynamic groups: tool / prompt / resource
+# --------------------------------------------------------------------------- #
+
+class HelpfulGroup(click.Group):
+    """On an unknown subcommand, print the error followed by the full help."""
+
+    hint = ""  # extra line to print after the error (e.g. a refresh tip)
+
+    def resolve_command(self, ctx, args):
+        try:
+            return super().resolve_command(ctx, args)
+        except click.UsageError as exc:
+            click.echo(f"Error: {exc.format_message()}\n", err=True)
+            if self.hint:
+                click.echo(f"{self.hint}\n", err=True)
+            click.echo(ctx.get_help(), err=True)
+            ctx.exit(2)
+
+
+class ServerGroup(HelpfulGroup):
+    """Like click.Group, but never truncates command descriptions.
+
+    click's default format_commands gives descriptions whatever width is left
+    after the longest command name; with long MCP tool names that is ~nothing
+    and every description collapses to "...". Instead, let write_dl put long
+    names on their own line and wrap the full first-line description under it.
+    """
+
+    def format_commands(self, ctx, formatter):
+        rows = []
+        for name in self.list_commands(ctx):
+            cmd = self.get_command(ctx, name)
+            if cmd is None or cmd.hidden:
+                continue
+            rows.append((name, cmd.get_short_help_str(limit=10_000)))
+        if rows:
+            with formatter.section("Commands"):
+                formatter.write_dl(rows)
+
+
+class ScopedGroup(HelpfulGroup):
+    """A group whose subcommands are the logged-in servers."
+
+    Progressive disclosure:
+        mcpx tool                    -> servers + bare item names
+        mcpx tool atlassian          -> items with one-line descriptions
+        mcpx tool atlassian NAME     -> full help for one item
+    """
+
+    kind = ""  # overridden: "tools" / "prompts" / "resources"
+
+    def items_for(self, entry: dict) -> list[dict]:
+        return entry.get(self.kind) or []
+
+    def list_commands(self, ctx):
+        return sorted(load_cache(ctx)["servers"])
+
+    def get_command(self, ctx, name):
+        entry = load_cache(ctx)["servers"].get(name)
+        if entry is None:
+            return None
+        group = ServerGroup(
+            name=name,
+            help=f"{self.kind.capitalize()} on the '{name}' MCP server.",
+            no_args_is_help=True,
+        )
+        group.hint = (
+            f"The catalog is cached at login time; if '{name}' changed, "
+            f"run `mcpx server {name} --refresh`."
+        )
+        for item in sorted(self.items_for(entry), key=lambda i: i["name"]):
+            group.add_command(self.build_command(item["name"], name, entry, item))
+        return group
+
+    def format_commands(self, ctx, formatter):
+        servers = load_cache(ctx)["servers"]
+        if not servers:
+            formatter.write_paragraph()
+            formatter.write_text(
+                "No servers yet -- run `mcpx server <server>` first."
+            )
+            return
+        rows = []
+        for sname in sorted(servers):
+            names = sorted(i["name"] for i in self.items_for(servers[sname]))
+            rows.append((sname, ", ".join(names) if names else f"(no {self.kind})"))
+        with formatter.section("Servers"):
+            formatter.write_dl(rows)
+
+    def build_command(self, name, server, entry, item) -> click.Command:
+        raise NotImplementedError
+
+
+class ToolGroup(ScopedGroup):
+    kind = "tools"
+
+    def build_command(self, name, server, entry, item):
+        options, dest_map = options_from_schema(item.get("inputSchema"))
+
+        def callback(**kwargs):
+            args = {dest_map[k]: v for k, v in kwargs.items() if v is not None}
+            print_tool_result(
+                run_on_server(server, entry, lambda c: c.call_tool(name, args))
+            )
+
+        return click.Command(
+            name, params=options, callback=callback,
+            help=item.get("description"),
+        )
+
+
+class PromptGroup(ScopedGroup):
+    kind = "prompts"
+
+    def build_command(self, name, server, entry, item):
+        options = []
+        for arg in item.get("arguments") or []:
+            is_required = bool(arg.get("required"))
+            kwargs = {} if is_required else {"default": None}
+            options.append(
+                click.Option(
+                    [f"--{arg['name'].replace('_', '-')}", dest_name(arg["name"])],
+                    required=is_required,
+                    help=(arg.get("description") or "").strip() or None,
+                    **kwargs,
+                )
+            )
+        names = {dest_name(a["name"]): a["name"] for a in item.get("arguments") or []}
+
+        def callback(**kwargs):
+            args = {names[k]: v for k, v in kwargs.items() if v is not None}
+            print_prompt_result(
+                run_on_server(server, entry, lambda c: c.get_prompt(name, args))
+            )
+
+        return click.Command(
+            name, params=options, callback=callback,
+            help=item.get("description"),
+        )
+
+
+# RFC 6570 expressions we understand: an optional operator followed by a
+# comma-separated variable list (no prefix `:n` or explode `*` modifiers).
+TEMPLATE_VAR = re.compile(r"{([+#./;?&]?)(\w+(?:,\w+)*)}")
+
+
+def template_placeholders(template: str) -> list[str]:
+    names: list[str] = []
+    for m in TEMPLATE_VAR.finditer(template):
+        names.extend(m.group(2).split(","))
+    return list(dict.fromkeys(names))  # dedupe, keep order
+
+
+def expand_template(template: str, values: dict) -> str:
+    """Expand the RFC 6570 URI template expressions matched by TEMPLATE_VAR."""
+    def sub(m: re.Match) -> str:
+        op, names = m.group(1), m.group(2).split(",")
+        # `+` and `#` allow reserved characters; the rest percent-encode them.
+        safe = "/:@!$&'()*+,;=" if op in "+#" else ""
+        enc = lambda n: quote(str(values[n]), safe=safe)  # noqa: E731
+        if op in ("", "+"):
+            return ",".join(enc(n) for n in names)
+        if op == "#":
+            return "#" + ",".join(enc(n) for n in names)
+        if op in (".", "/"):
+            return op + op.join(enc(n) for n in names)
+        sep = ";" if op == ";" else "&"  # ; ? & -> name=value pairs
+        return op + sep.join(f"{n}={enc(n)}" for n in names)
+
+    return TEMPLATE_VAR.sub(sub, template)
+
+
+class ResourceGroup(ScopedGroup):
+    kind = "resources"
+
+    def items_for(self, entry):
+        return (entry.get("resources") or []) + (entry.get("templates") or [])
+
+    def build_command(self, name, server, entry, item):
+        template = item.get("uriTemplate")
+        options: list[click.Option] = []
+        placeholders = template_placeholders(template) if template else []
+        for ph in placeholders:
+            options.append(click.Option([f"--{ph.replace('_', '-')}", ph], required=True))
+
+        def callback(**kwargs):
+            if template:
+                uri = expand_template(template, kwargs)
+                if "{" in uri:
+                    raise click.ClickException(
+                        f"unsupported URI template expression in: {uri}"
+                    )
+            else:
+                uri = item["uri"]
+            print_resource_result(
+                run_on_server(server, entry, lambda c: c.read_resource(uri))
+            )
+
+        help_text = item.get("description") or ""
+        uri_note = template or item.get("uri") or ""
+        return click.Command(
+            name, params=options, callback=callback,
+            help=f"{help_text}\n\nURI: {uri_note}".strip(),
+        )
+
+
+# --------------------------------------------------------------------------- #
+# top-level CLI
+# --------------------------------------------------------------------------- #
+
+@click.group()
+@click.option(
+    "--config", "-c", default=".mcp.json", show_default=True,
+    help="Path to an MCP config file (Claude-style mcpServers JSON). "
+    "Servers from ~/.config/mcpx/mcp.json are also loaded; local entries win.",
+)
+@click.option(
+    "--ca-bundle", envvar="MCPX_CA_BUNDLE",
+    type=click.Path(exists=True, dir_okay=False),
+    help="CA bundle for TLS verification (e.g. a Zscaler bundle). "
+    "Remembered at login time. [env: MCPX_CA_BUNDLE]",
+)
+@click.pass_context
+def cli(ctx, config, ca_bundle):
+    """mcpx -- interact with MCP servers from the command line.
+
+    Run `mcpx server [SERVER]` first; tools, prompts, and resources from each
+    logged-in server become subcommands of `mcpx tool`, `mcpx prompt`, and
+    `mcpx resource`.
+    """
+    if ca_bundle:
+        apply_ca_bundle(ca_bundle)
+    elif load_cache(ctx).get("ca_bundle"):
+        # Re-apply the CA bundle remembered at login time.
+        apply_ca_bundle(load_cache(ctx)["ca_bundle"], override=False)
+
+
+@cli.command(name="server")
+@click.argument("server", required=False)
+@click.option(
+    "--refresh", is_flag=True,
+    help="Re-fetch the catalog of an already logged-in server without "
+    "going through the auth flow again.",
+)
+@click.option(
+    "--list", "list_", is_flag=True,
+    help="List logged-in servers with their auth mode and catalog age.",
+)
+@click.pass_context
+def server_cmd(ctx, server, refresh, list_):
+    """Log in to SERVER (or all servers in the config) and cache its catalog.
+
+    With --refresh, reuse the existing auth and just re-fetch the tools,
+    prompts, and resources (handy while developing a server).
+    """
+    if list_:
+        entries = load_cache(ctx)["servers"]
+        if not entries:
+            click.echo("no servers logged in yet -- run `mcpx server` first")
+            return
+        try:  # prefer live descriptions so config edits show up immediately
+            configs = load_config(config_path_from_ctx(ctx))
+        except click.ClickException:
+            configs = {}
+        for name in sorted(entries):
+            e = entries[name]
+            click.echo(
+                f"{name}: auth={e.get('auth') or 'none'}, "
+                f"{len(e.get('tools') or [])} tools, "
+                f"{len(e.get('prompts') or [])} prompts, "
+                f"{len(e.get('resources') or []) + len(e.get('templates') or [])} "
+                f"resources, fetched {e.get('fetched') or 'unknown'}"
+            )
+            desc = (configs.get(name) or e.get("config") or {}).get("description")
+            if desc:
+                click.echo(f"    {desc}")
+        return
+
+    config_path = config_path_from_ctx(ctx)
+    servers = load_config(config_path)
+
+    if server:
+        if server not in servers:
+            raise click.ClickException(
+                f"server '{server}' not in {config_path} "
+                f"(known: {', '.join(servers)})"
+            )
+        targets = {server: servers[server]}
+    else:
+        targets = servers
+
+    cache = load_cache(ctx)
+    ca_bundle = ctx.find_root().params.get("ca_bundle")
+    if ca_bundle:
+        cache["ca_bundle"] = str(Path(ca_bundle).expanduser().resolve())
+
+    for name, cfg in targets.items():
+        if refresh:
+            entry = cache["servers"].get(name)
+            if entry is None:
+                raise click.ClickException(
+                    f"'{name}' is not logged in yet -- run `mcpx server {name}` first"
+                )
+            click.echo(f"==> refreshing {name} ...", err=True)
+            auth = entry.get("auth")
+            catalog = asyncio.run(refresh_server(name, cfg, auth))
+        else:
+            click.echo(f"==> logging in to {name} ...", err=True)
+            auth, catalog = asyncio.run(login_server(name, cfg))
+        fetched = datetime.now(timezone.utc).isoformat(timespec="seconds")
+        cache["servers"][name] = {
+            "config": cfg, "auth": auth, "fetched": fetched, **catalog,
+        }
+        click.echo(
+            f"    ok ({len(catalog['tools'])} tools, "
+            f"{len(catalog['prompts'])} prompts, "
+            f"{len(catalog['resources']) + len(catalog['templates'])} resources)"
+            + (" [oauth]" if auth else ""),
+            err=True,
+        )
+
+    # Drop cache entries for servers that are no longer in the config.
+    for stale in sorted(set(cache["servers"]) - set(servers)):
+        del cache["servers"][stale]
+        click.echo(f"==> pruned stale server '{stale}' from the cache", err=True)
+
+    save_cache(config_path, cache)
+
+
+async def connect_and_fetch(name: str, cfg: dict, auth: str | None) -> dict:
+    async with build_client(name, cfg, auth) as client:
+        return await fetch_catalog(client)
+
+
+async def refresh_server(name: str, cfg: dict, auth: str | None) -> dict:
+    """Re-fetch the catalog using the auth mode cached at login time."""
+    try:
+        return await connect_and_fetch(name, cfg, auth)
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(
+            f"could not refresh '{name}': {exc} "
+            f"(try `mcpx server {name}` to log in again)"
+        )
+
+
+async def login_server(name: str, cfg: dict) -> tuple[str | None, dict]:
+    """Connect (falling back to OAuth for HTTP servers) and fetch the catalog."""
+    try:
+        return None, await connect_and_fetch(name, cfg, None)
+    except Exception as exc:  # noqa: BLE001
+        if not server_is_http(cfg):
+            raise click.ClickException(f"could not connect to '{name}': {exc}")
+        click.echo(f"    plain connection failed ({exc}); trying OAuth ...", err=True)
+    try:
+        return "oauth", await connect_and_fetch(name, cfg, "oauth")
+    except Exception as exc:  # noqa: BLE001
+        raise click.ClickException(f"could not connect to '{name}': {exc}")
+
+
+async def fetch_catalog(client: Client) -> dict:
+    async def safe(coro):
+        try:
+            return await coro
+        except Exception:  # capability not supported
+            return []
+
+    tools = await safe(client.list_tools())
+    prompts = await safe(client.list_prompts())
+    resources = await safe(client.list_resources())
+    templates = await safe(client.list_resource_templates())
+    dump = lambda xs: [x.model_dump(mode="json") for x in xs]  # noqa: E731
+    return {
+        "tools": dump(tools),
+        "prompts": dump(prompts),
+        "resources": dump(resources),
+        "templates": dump(templates),
+    }
+
+
+@cli.group(cls=ToolGroup, name="tool", no_args_is_help=True)
+def tool():
+    """Call a tool on a logged-in server.
+
+    Usage: `mcpx tool <server> <tool-name> [OPTIONS]`.
+    """
+
+
+@cli.group(cls=PromptGroup, name="prompt", no_args_is_help=True)
+def prompt():
+    """Render a prompt from a logged-in server."""
+
+
+@cli.group(cls=ResourceGroup, name="resource", no_args_is_help=True)
+def resource():
+    """Read a resource (or resource template) from a logged-in server."""
+
+
+if __name__ == "__main__":
+    cli()
