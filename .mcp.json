@@ -1,0 +1,1 @@
+{"mcpServers": {"test": {"type": "stdio", "command": "uv", "args": ["run", "--script", "test_server.py"]}}}
