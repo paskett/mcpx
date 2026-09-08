@@ -157,10 +157,36 @@ def dest_name(name: str) -> str:
     return re.sub(r"\W", "_", name)
 
 
-def run_on_server(server: str, entry: dict, action):
+def parse_headers(pairs: tuple[str, ...]) -> dict[str, str]:
+    """Parse `-H name:value` pairs into a header dict."""
+    headers: dict[str, str] = {}
+    for pair in pairs:
+        name, sep, value = pair.partition(":")
+        if not sep or not name.strip():
+            raise click.ClickException(
+                f"invalid header {pair!r} (expected 'name:value')"
+            )
+        headers[name.strip()] = value.strip()
+    return headers
+
+
+# Short flag only: tool parameters become long options (--name), so `-H`
+# can never collide with a generated option, while `--header` could.
+HEADER_OPTION = click.Option(
+    ["-H", "_mcpx_headers"],
+    multiple=True,
+    metavar="NAME:VALUE",
+    help="Extra HTTP header to send (repeatable; HTTP servers only). "
+    "Overrides headers from the config on collisions.",
+)
+
+
+def run_on_server(server: str, entry: dict, action, headers: dict | None = None):
     """Open a client to a cached server and run an async action on it."""
     async def go():
-        async with build_client(server, entry["config"], entry.get("auth")) as client:
+        async with build_client(
+            server, entry["config"], entry.get("auth"), headers
+        ) as client:
             return await action(client)
 
     try:
@@ -175,19 +201,26 @@ def run_on_server(server: str, entry: dict, action):
         )
 
 
-def build_client(name: str, cfg: dict, auth: str | None) -> Client:
+def build_client(
+    name: str, cfg: dict, auth: str | None, headers: dict | None = None
+) -> Client:
     # "description" is an mcpx extension for `mcpx server --list`; strip it
     # before handing the config to fastmcp.
     cfg = {k: v for k, v in cfg.items() if k != "description"}
     if server_is_http(cfg):
         kwargs = {}
-        if cfg.get("headers"):
-            kwargs["headers"] = cfg["headers"]
+        merged = {**(cfg.get("headers") or {}), **(headers or {})}
+        if merged:
+            kwargs["headers"] = merged
         if auth == "oauth":
             kwargs["auth"] = make_oauth(cfg["url"])
         return Client(cfg["url"], **kwargs)
     # stdio & friends: hand the single-server config to fastmcp (no prefixing
     # happens for a single server)
+    if headers:
+        raise click.ClickException(
+            f"-H/--header only applies to HTTP servers ('{name}' is stdio)"
+        )
     return Client({"mcpServers": {name: cfg}})
 
 
@@ -414,14 +447,17 @@ class ToolGroup(ScopedGroup):
     def build_command(self, name, server, entry, item):
         options, dest_map = options_from_schema(item.get("inputSchema"))
 
-        def callback(**kwargs):
+        def callback(_mcpx_headers=(), **kwargs):
+            headers = parse_headers(_mcpx_headers)
             args = {dest_map[k]: v for k, v in kwargs.items() if v is not None}
             print_tool_result(
-                run_on_server(server, entry, lambda c: c.call_tool(name, args))
+                run_on_server(
+                    server, entry, lambda c: c.call_tool(name, args), headers
+                )
             )
 
         return click.Command(
-            name, params=options, callback=callback,
+            name, params=options + [HEADER_OPTION], callback=callback,
             help=item.get("description"),
         )
 
@@ -444,14 +480,17 @@ class PromptGroup(ScopedGroup):
             )
         names = {dest_name(a["name"]): a["name"] for a in item.get("arguments") or []}
 
-        def callback(**kwargs):
+        def callback(_mcpx_headers=(), **kwargs):
+            headers = parse_headers(_mcpx_headers)
             args = {names[k]: v for k, v in kwargs.items() if v is not None}
             print_prompt_result(
-                run_on_server(server, entry, lambda c: c.get_prompt(name, args))
+                run_on_server(
+                    server, entry, lambda c: c.get_prompt(name, args), headers
+                )
             )
 
         return click.Command(
-            name, params=options, callback=callback,
+            name, params=options + [HEADER_OPTION], callback=callback,
             help=item.get("description"),
         )
 
@@ -500,7 +539,8 @@ class ResourceGroup(ScopedGroup):
         for ph in placeholders:
             options.append(click.Option([f"--{ph.replace('_', '-')}", ph], required=True))
 
-        def callback(**kwargs):
+        def callback(_mcpx_headers=(), **kwargs):
+            headers = parse_headers(_mcpx_headers)
             if template:
                 uri = expand_template(template, kwargs)
                 if "{" in uri:
@@ -510,13 +550,15 @@ class ResourceGroup(ScopedGroup):
             else:
                 uri = item["uri"]
             print_resource_result(
-                run_on_server(server, entry, lambda c: c.read_resource(uri))
+                run_on_server(
+                    server, entry, lambda c: c.read_resource(uri), headers
+                )
             )
 
         help_text = item.get("description") or ""
         uri_note = template or item.get("uri") or ""
         return click.Command(
-            name, params=options, callback=callback,
+            name, params=options + [HEADER_OPTION], callback=callback,
             help=f"{help_text}\n\nURI: {uri_note}".strip(),
         )
 
