@@ -194,11 +194,15 @@ def run_on_server(server: str, entry: dict, action, headers: dict | None = None)
     except click.ClickException:
         raise
     except Exception as exc:  # noqa: BLE001
-        raise click.ClickException(
-            f"request to '{server}' failed: {exc} "
-            f"(the catalog is cached at login time; "
-            f"try `mcpx server {server} --refresh`)"
-        )
+        msg = f"request to '{server}' failed: {exc}"
+        # Only suggest refreshing the cached catalog when the error looks
+        # like a stale catalog (server no longer knows the requested item).
+        if re.search(r"unknown (tool|prompt|resource)|not found", str(exc), re.I):
+            msg += (
+                f" (the catalog is cached at login time; "
+                f"try `mcpx server {server} --refresh`)"
+            )
+        raise click.ClickException(msg)
 
 
 def build_client(
