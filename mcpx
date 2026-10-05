@@ -7,7 +7,7 @@
 #     "py-key-value-aio[filetree]>=0.4",
 # ]
 # ///
-"""mcpx -- a sweet little CLI for talking to MCP servers.
+"""mcpx -- a basic little CLI for talking to MCP servers.
 
 Workflow:
     echo '{"mcpServers": {"atlassian": {"type": "http", "url": "https://mcp.atlassian.com/v1/mcp"}}}' > .mcp.json
@@ -607,7 +607,8 @@ def cli(ctx, config, ca_bundle):
 )
 @click.option(
     "--list", "list_", is_flag=True,
-    help="List logged-in servers with their auth mode and catalog age.",
+    help="List configured servers; logged-in ones show auth mode and "
+    "catalog age.",
 )
 @click.pass_context
 def server_cmd(ctx, server, refresh, list_):
@@ -618,15 +619,23 @@ def server_cmd(ctx, server, refresh, list_):
     """
     if list_:
         entries = load_cache(ctx)["servers"]
-        if not entries:
-            click.echo("no servers logged in yet -- run `mcpx server` first")
-            return
         try:  # prefer live descriptions so config edits show up immediately
             configs = load_config(config_path_from_ctx(ctx))
         except click.ClickException:
             configs = {}
-        for name in sorted(entries):
-            e = entries[name]
+        if not entries and not configs:
+            click.echo("no servers configured -- add some to .mcp.json first")
+            return
+        for name in sorted(set(entries) | set(configs)):
+            e = entries.get(name)
+            if e is None:
+                click.echo(
+                    f"{name}: not logged in -- run `mcpx server {name}` first"
+                )
+                desc = configs[name].get("description")
+                if desc:
+                    click.echo(f"    {desc}")
+                continue
             click.echo(
                 f"{name}: auth={e.get('auth') or 'none'}, "
                 f"{len(e.get('tools') or [])} tools, "
